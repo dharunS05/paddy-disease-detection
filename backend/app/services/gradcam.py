@@ -3,6 +3,7 @@ import tensorflow as tf
 from PIL import Image
 import base64
 import io
+import matplotlib.pyplot as plt
 
 
 def compute_gradcam(img_array: np.ndarray, class_idx: int) -> np.ndarray:
@@ -22,11 +23,10 @@ def compute_gradcam(img_array: np.ndarray, class_idx: int) -> np.ndarray:
 
 
 def make_gradcam_b64(raw_img_bytes: bytes, img_array: np.ndarray, class_idx: int, alpha: float = 0.45) -> str:
-    import matplotlib.cm as cm
     heatmap = compute_gradcam(img_array, class_idx)
     orig = Image.open(io.BytesIO(raw_img_bytes)).convert("RGB").resize((224, 224))
     hm_pil = Image.fromarray(np.uint8(255 * heatmap), mode="L").resize((224, 224), Image.LANCZOS)
-    colormap = cm.get_cmap("jet")
+    colormap = plt.get_cmap("jet")   # ← fix
     hm_colored = np.uint8(colormap(np.array(hm_pil) / 255.0) * 255)[:, :, :3]
     hm_img = Image.fromarray(hm_colored)
     overlay = Image.blend(orig, hm_img, alpha=alpha)
