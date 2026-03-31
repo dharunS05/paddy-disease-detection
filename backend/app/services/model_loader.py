@@ -2,23 +2,20 @@ import os
 import tensorflow as tf
 from huggingface_hub import hf_hub_download
 
-MODEL_REPO = "mlresearcher05/paddy-disease-detection"
-MODEL_SUBDIR = "models"
-# Update MODEL_FILENAME to match your actual filename in HuggingFace
+MODEL_REPO     = "mlresearcher05/paddy_disease_detection"   # ← underscore
+MODEL_SUBDIR   = "models"
 MODEL_FILENAME = os.getenv("MODEL_FILENAME", "rice_v3_efficientnet_best_full_finetune.keras")
 LOCAL_MODEL_PATH = "/app/models/model.keras"
-
 
 class ModelLoader:
     model = None
     gradcam_model = None
-    LAST_CONV_LAYER = "top_conv"  # EfficientNetB3 last conv layer
+    LAST_CONV_LAYER = "top_conv"
 
     @classmethod
     def load(cls):
-        # Use local model if present (mounted volume in Docker)
         if os.path.exists(LOCAL_MODEL_PATH):
-            print(f"[ModelLoader] Loading from local path: {LOCAL_MODEL_PATH}")
+            print(f"[ModelLoader] Loading from local: {LOCAL_MODEL_PATH}")
             path = LOCAL_MODEL_PATH
         else:
             print(f"[ModelLoader] Downloading from HuggingFace: {MODEL_REPO}")
@@ -27,7 +24,6 @@ class ModelLoader:
                 filename=f"{MODEL_SUBDIR}/{MODEL_FILENAME}",
                 cache_dir="/app/models/hf_cache",
             )
-
         cls.model = tf.keras.models.load_model(path, compile=False)
         cls._build_gradcam_model()
         print("[ModelLoader] Model loaded successfully.")
