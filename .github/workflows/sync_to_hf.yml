@@ -45,8 +45,3 @@ jobs:
           git add -A
           git diff --cached --quiet || git commit -m "deploy: ${{ github.sha }}"
           git push
-```
-
-Also make sure your **HF Space was created with underscore**:
-```
-huggingface.co/spaces/mlresearcher05/paddy_disease_detection
