@@ -1,0 +1,11 @@
+.env
+backend/models/
+node_modules/
+__pycache__/
+*.pyc
+*.keras
+*.h5
+*.tflite
+dist/
+.venv/
+hf_cache/

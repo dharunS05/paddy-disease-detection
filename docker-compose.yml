@@ -1,0 +1,31 @@
+version: '3.9'
+
+services:
+  backend:
+    build: ./backend
+    container_name: paddy-backend
+    env_file: .env
+    volumes:
+      - ./backend/models:/app/models   # mount local model if available
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: paddy-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  default:
+    name: paddy-network
