@@ -4,15 +4,21 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 import os
+
 from app.services.model_loader import ModelLoader
+from app.services.weather_model_loader import WeatherModelLoader
 from app.routes.predict import router as predict_router
+from app.routes.weather import router as weather_router
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ModelLoader.load()
+    WeatherModelLoader.load()
     yield
 
-app = FastAPI(title="Paddy Disease Detection API", version="1.0.0", lifespan=lifespan)
+
+app = FastAPI(title="Paddy Disease Detection API", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,10 +28,17 @@ app.add_middleware(
 )
 
 app.include_router(predict_router, prefix="/api")
+app.include_router(weather_router, prefix="/api")
+
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": ModelLoader.model is not None}
+    return {
+        "status": "ok",
+        "leaf_model":    ModelLoader.model is not None,
+        "weather_model": WeatherModelLoader.xgb_model is not None,
+    }
+
 
 # Serve React frontend
 static_dir = "/app/static"
@@ -38,9 +51,7 @@ if os.path.exists(static_dir):
 
     @app.get("/{full_path:path}")
     def serve_spa(full_path: str):
-        file_path = f"{static_dir}/{full_path}"
-        if os.path.exists(file_path):
-            return FileResponse(file_path)
-        return FileResponse(f"{static_dir}/index.html")
+        fp = f"{static_dir}/{full_path}"
+        return FileResponse(fp) if os.path.exists(fp) else FileResponse(f"{static_dir}/index.html")
 else:
     print(f"WARNING: static dir not found at {static_dir}")
