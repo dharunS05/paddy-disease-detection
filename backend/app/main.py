@@ -4,6 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 import os
+import asyncio
 
 from app.services.model_loader import ModelLoader
 from app.services.weather_model_loader import WeatherModelLoader
@@ -11,10 +12,16 @@ from app.routes.predict import router as predict_router
 from app.routes.weather import router as weather_router
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+def _load_all_models():
     ModelLoader.load()
     WeatherModelLoader.load()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load both models in background thread — app starts immediately
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _load_all_models)
     yield
 
 
@@ -40,7 +47,6 @@ def health():
     }
 
 
-# Serve React frontend
 static_dir = "/app/static"
 if os.path.exists(static_dir):
     app.mount("/assets", StaticFiles(directory=f"{static_dir}/assets"), name="assets")

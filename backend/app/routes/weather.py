@@ -2,8 +2,17 @@ from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
 from app.services.weather_predictor import get_forecast, geocode
 from app.services.weather_info import DISTRICTS
+from app.services.weather_model_loader import WeatherModelLoader
 
 router = APIRouter()
+
+
+@router.get("/weather/ready")
+def weather_ready():
+    """Frontend polls this to know when weather model is loaded."""
+    ready = WeatherModelLoader.xgb_model is not None
+    return {"ready": ready}
+
 
 @router.get("/weather/districts")
 def list_districts():
@@ -11,6 +20,7 @@ def list_districts():
         {"name": k, "lat": v["lat"], "lon": v["lon"], "state": v["state"]}
         for k, v in DISTRICTS.items()
     ]}
+
 
 @router.get("/weather/search")
 async def search_location(q: str = Query(..., min_length=2)):
@@ -21,13 +31,18 @@ async def search_location(q: str = Query(..., min_length=2)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Geocoding failed: {e}")
 
+
 @router.get("/weather/forecast")
 async def weather_forecast(
-    district: Optional[str]  = Query(None),
+    district: Optional[str]   = Query(None),
     lat:      Optional[float] = Query(None),
     lon:      Optional[float] = Query(None),
     location: Optional[str]   = Query(None),
 ):
+    # Return 503 if model still loading
+    if not WeatherModelLoader.xgb_model:
+        raise HTTPException(status_code=503, detail="Weather model still loading, please wait...")
+
     if district:
         if district not in DISTRICTS:
             raise HTTPException(status_code=404, detail="District not found.")

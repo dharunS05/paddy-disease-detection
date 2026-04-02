@@ -102,24 +102,28 @@ export default function WeatherForecast() {
   const [searching, setSearching]         = useState(false)
   const searchTimer                       = useRef(null)
 
-  useEffect(() => {
-    getDistricts().then(d => {
-      setDistricts(d)
-      // Auto-load Thanjavur on mount
-      loadForecast({ district: 'Thanjavur' })
-    }).catch(() => {})
-  }, [])
+ useEffect(() => {
+  getDistricts().then(setDistricts).catch(() => {})
+  pollUntilReady()
+}, [])
 
-  useEffect(() => {
-    if (mode !== 'search' || searchQuery.length < 2) { setSearchResults([]); return }
-    clearTimeout(searchTimer.current)
-    searchTimer.current = setTimeout(async () => {
-      setSearching(true)
-      try { setSearchResults(await searchLocation(searchQuery)) }
-      catch { setSearchResults([]) }
-      setSearching(false)
-    }, 500)
-  }, [searchQuery, mode])
+async function pollUntilReady() {
+  setLoading(true)
+  // Poll /api/weather/ready every 3 seconds until model loaded
+  for (let i = 0; i < 20; i++) {
+    try {
+      const resp = await fetch('/api/weather/ready')
+      const data = await resp.json()
+      if (data.ready) {
+        loadForecast({ district: 'Thanjavur' })
+        return
+      }
+    } catch {}
+    await new Promise(r => setTimeout(r, 3000))
+  }
+  setError('Weather model took too long to load. Please refresh.')
+  setLoading(false)
+}
 
   async function loadForecast(params) {
     setLoading(true); setError(null)
@@ -207,14 +211,15 @@ export default function WeatherForecast() {
       {error && <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-sm text-red-600">⚠️ {error}</div>}
 
       {loading && (
-        <div className="flex items-center justify-center gap-2 py-8 text-primary">
-          <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24" fill="none">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
-          </svg>
-          <span className="text-sm font-medium">Loading forecast...</span>
-        </div>
-      )}
+          <div className="flex flex-col items-center justify-center gap-2 py-10 text-primary">
+          <svg className="animate-spin h-6 w-6" viewBox="0 0 24 24" fill="none">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+    </svg>
+    <p className="text-sm font-medium">Loading weather model...</p>
+    <p className="text-xs text-gray-400">Downloading from HuggingFace, please wait</p>
+  </div>
+)}
 
       {forecast && !loading && (
         <>
