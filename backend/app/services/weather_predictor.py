@@ -16,7 +16,7 @@ DAILY_VARS = [
 ]
 
 
-async def geocode(query: str) -> dict:
+async def geocode(query: str) -> list:
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(GEOCODE_URL, params={"name": query, "count": 5, "language": "en"})
         r.raise_for_status()
@@ -71,16 +71,13 @@ def _add_features(df: pd.DataFrame, district_name: str = None) -> pd.DataFrame:
     df["month"]             = df["date"].dt.month
     df["day_of_year"]       = df["date"].dt.dayofyear
 
-    # Add district one-hot columns (all zeros by default)
     for col in DISTRICT_COLS:
         df[col] = 0
-
-    # Set 1 for matched training district, else nearest (default Thanjavur)
     matched = f"district_{district_name}" if district_name in TRAINING_DISTRICTS else None
     if matched and matched in DISTRICT_COLS:
         df[matched] = 1
     else:
-        df[DISTRICT_COLS[0]] = 1  # default to Thanjavur encoding
+        df[DISTRICT_COLS[0]] = 1  # default Thanjavur
 
     return df
 
@@ -91,45 +88,47 @@ def _predict_ensemble(df: pd.DataFrame) -> list:
     xgb_model = WeatherModelLoader.xgb_model
     tcn_model = WeatherModelLoader.tcn_model
 
-    X_raw    = df[FEATURE_COLS].values.astype(np.float32)  # (7, 21)
-    X_scaled = scaler.transform(X_raw)                      # (7, 21)
+    X_raw    = df[FEATURE_COLS].values.astype(np.float32)
+    X_scaled = scaler.transform(X_raw)
 
     results = []
     for day_idx in range(len(df)):
         start  = max(0, day_idx - WINDOW_SIZE + 1)
         window = X_scaled[start:day_idx + 1]
-
         if len(window) < WINDOW_SIZE:
             pad    = np.zeros((WINDOW_SIZE - len(window), X_scaled.shape[1]))
             window = np.vstack([pad, window])
 
-        # XGBoost: flattened (1, 147)
-        X_xgb    = window.reshape(1, -1)
-        xgb_pred = xgb_model.predict(X_xgb)[0]
-
-        # TCN: (1, 7, 21)
-        X_tcn   = window[np.newaxis, ...]
-        tcn_raw = tcn_model.predict(X_tcn, verbose=0)
+        xgb_pred  = xgb_model.predict(window.reshape(1, -1))[0]
+        tcn_raw   = tcn_model.predict(window[np.newaxis, ...], verbose=0)
         tcn_probs = [tcn_raw[i][0] for i in range(4)]
 
+        row = df.iloc[day_idx]
         day_result = {
-            "date": df.iloc[day_idx]["date"].strftime("%Y-%m-%d"),
+            "date": row["date"].strftime("%Y-%m-%d"),
+            # Raw weather for UI display
+            "weather": {
+                "temp_mean":  round(float(row["temperature_mean"]), 1),
+                "temp_max":   round(float(row["temperature_max"]), 1),
+                "temp_min":   round(float(row["temperature_min"]), 1),
+                "humidity":   round(float(row["humidity"]), 1),
+                "rainfall":   round(float(row["rainfall"]), 2),
+                "wind_speed": round(float(row["wind_speed"]), 1),
+            },
             "diseases": {}
         }
 
         for i, disease in enumerate(DISEASES):
             xgb_class  = int(xgb_pred[i])
-            tcn_class  = int(np.argmax(tcn_probs[i]))
             xgb_onehot = np.zeros(3); xgb_onehot[xgb_class] = 1.0
             ensemble   = 0.6 * xgb_onehot + 0.4 * tcn_probs[i]
             final      = int(np.argmax(ensemble))
-            confidence = float(np.max(ensemble))
 
             day_result["diseases"][disease] = {
                 "risk":       RISK_LEVELS[final],
-                "confidence": round(confidence, 3),
+                "confidence": round(float(np.max(ensemble)), 3),
                 "xgb_risk":   RISK_LEVELS[xgb_class],
-                "tcn_risk":   RISK_LEVELS[tcn_class],
+                "tcn_risk":   RISK_LEVELS[int(np.argmax(tcn_probs[i]))],
             }
 
         results.append(day_result)
@@ -141,4 +140,9 @@ async def get_forecast(lat: float, lon: float, location_name: str, district_name
     df          = await fetch_forecast(lat, lon)
     df          = _add_features(df, district_name=district_name)
     predictions = _predict_ensemble(df)
-    return {"location": location_name, "lat": lat, "lon": lon, "forecast": predictions}
+    return {
+        "location": location_name,
+        "lat": lat,
+        "lon": lon,
+        "forecast": predictions,
+    }
