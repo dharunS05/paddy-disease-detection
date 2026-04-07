@@ -26,8 +26,11 @@ def _load_all_models():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # FIXED: asyncio.get_event_loop().run_in_executor returns a Future that
+    # must be stored. Without storing it, Python garbage-collects it immediately
+    # and the thread never actually starts.
     loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, _load_all_models)
+    asyncio.ensure_future(loop.run_in_executor(None, _load_all_models))
     yield
 
 
