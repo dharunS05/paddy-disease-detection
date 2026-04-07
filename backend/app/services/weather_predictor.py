@@ -1,6 +1,11 @@
+import asyncio
 import numpy as np
 import pandas as pd
 import httpx
+import openmeteo_requests
+import requests_cache
+from retry_requests import retry
+
 from app.services.weather_info import (
     FEATURE_COLS, BASE_FEATURE_COLS, DISTRICT_COLS,
     TRAINING_DISTRICTS, DISEASES, RISK_LEVELS, WINDOW_SIZE
@@ -15,7 +20,14 @@ DAILY_VARS = [
     "relative_humidity_2m_mean", "precipitation_sum", "wind_speed_10m_max",
 ]
 
+# --- Official Open-Meteo SDK client (sync, with cache + auto-retry) ----------
+_cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
+_retry_session = retry(_cache_session, retries=5, backoff_factor=0.2)
+_openmeteo    = openmeteo_requests.Client(session=_retry_session)
+# -----------------------------------------------------------------------------
 
+
+# geocode still uses httpx (geocoding API works fine with JSON)
 async def geocode(query: str) -> list:
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(GEOCODE_URL, params={"name": query, "count": 5, "language": "en"})
@@ -34,40 +46,57 @@ async def geocode(query: str) -> list:
     ]
 
 
-async def fetch_forecast(lat: float, lon: float) -> pd.DataFrame:
-    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
-        for attempt in range(3):
-            try:
-                r = await client.get(FORECAST_URL, params={
-                    "latitude": lat,
-                    "longitude": lon,
-                    "daily": ",".join(DAILY_VARS),  # ← fix: comma-separated string
-                    "forecast_days": 7,
-                    "timezone": "auto",
-                })
-                r.raise_for_status()
-                break
-            except (httpx.ConnectTimeout, httpx.ReadTimeout) as e:
-                if attempt == 2:
-                    raise RuntimeError(
-                        "Weather API unreachable after 3 attempts."
-                    ) from e
-        data = r.json()
+def _fetch_forecast_sync(lat: float, lon: float) -> pd.DataFrame:
+    """
+    Calls Open-Meteo via the official SDK (synchronous).
+    Uses FlatBuffers under the hood — more reliable than raw JSON endpoint.
+    Cache: 1 hour. Retries: 5 with exponential backoff.
+    """
+    params = {
+        "latitude":     lat,
+        "longitude":    lon,
+        "daily":        DAILY_VARS,   # SDK accepts a list directly
+        "forecast_days": 7,
+        "timezone":     "auto",
+    }
 
-    daily = data["daily"]
-    # ... rest unchanged
+    responses = _openmeteo.weather_api(FORECAST_URL, params=params)
+    response  = responses[0]
 
-    daily = data["daily"]
-    df = pd.DataFrame({
-        "date":             pd.to_datetime(daily["time"]),
-        "temperature_mean": daily["temperature_2m_mean"],
-        "temperature_max":  daily["temperature_2m_max"],
-        "temperature_min":  daily["temperature_2m_min"],
-        "humidity":         daily["relative_humidity_2m_mean"],
-        "rainfall":         daily["precipitation_sum"],
-        "wind_speed":       daily["wind_speed_10m_max"],
-    })
+    daily = response.Daily()
+
+    # Variables are returned in the same order as DAILY_VARS
+    # DAILY_VARS = [mean, max, min, humidity, rainfall, wind_speed]
+    daily_data = {
+        "date": pd.date_range(
+            start=pd.to_datetime(daily.Time(),    unit="s", utc=True),
+            end=  pd.to_datetime(daily.TimeEnd(), unit="s", utc=True),
+            freq= pd.Timedelta(seconds=daily.Interval()),
+            inclusive="left",
+        ),
+        "temperature_mean": daily.Variables(0).ValuesAsNumpy(),
+        "temperature_max":  daily.Variables(1).ValuesAsNumpy(),
+        "temperature_min":  daily.Variables(2).ValuesAsNumpy(),
+        "humidity":         daily.Variables(3).ValuesAsNumpy(),
+        "rainfall":         daily.Variables(4).ValuesAsNumpy(),
+        "wind_speed":       daily.Variables(5).ValuesAsNumpy(),
+    }
+
+    df = pd.DataFrame(data=daily_data)
+
+    # Strip timezone so downstream .dt.month etc. work without warnings
+    df["date"] = df["date"].dt.tz_localize(None)
+
     return df.ffill().fillna(0)
+
+
+async def fetch_forecast(lat: float, lon: float) -> pd.DataFrame:
+    """
+    Async wrapper — runs the sync SDK call in a thread pool so FastAPI
+    event loop is never blocked.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _fetch_forecast_sync, lat, lon)
 
 
 def _add_features(df: pd.DataFrame, district_name: str = None) -> pd.DataFrame:
@@ -118,7 +147,6 @@ def _predict_ensemble(df: pd.DataFrame) -> list:
         row = df.iloc[day_idx]
         day_result = {
             "date": row["date"].strftime("%Y-%m-%d"),
-            # Raw weather for UI display
             "weather": {
                 "temp_mean":  round(float(row["temperature_mean"]), 1),
                 "temp_max":   round(float(row["temperature_max"]), 1),
