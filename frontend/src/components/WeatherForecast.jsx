@@ -96,19 +96,42 @@ export default function WeatherForecast() {
   const [searching, setSearching]         = useState(false)
   const searchTimer                       = useRef(null)
 
-  // FIX: track whether pollUntilReady has already triggered a forecast load.
-  // Without this, React StrictMode (dev) runs the effect twice → 2 simultaneous
-  // API calls → "too many concurrent requests" on Open-Meteo.
   const forecastTriggered = useRef(false)
 
   useEffect(() => {
     getDistricts().then(setDistricts).catch(() => {})
-    // Guard: only start polling once even if StrictMode mounts twice
     if (!forecastTriggered.current) {
       forecastTriggered.current = true
       pollUntilReady()
     }
   }, [])
+
+  // FIX: wire up debounced search — previously searchTimer was declared but
+  // never used; the onChange only set state and never called searchLocation.
+  useEffect(() => {
+    if (mode !== 'search') return
+    const query = searchQuery.trim()
+    if (query.length < 2) {
+      setSearchResults([])
+      return
+    }
+    // Debounce: clear previous timer, fire after 400 ms idle
+    clearTimeout(searchTimer.current)
+    searchTimer.current = setTimeout(async () => {
+      setSearching(true)
+      try {
+        const results = await searchLocation(query)
+        setSearchResults(results)
+      } catch {
+        setSearchResults([])
+      } finally {
+        setSearching(false)
+      }
+    }, 400)
+
+    // Cleanup on unmount or next keystroke
+    return () => clearTimeout(searchTimer.current)
+  }, [searchQuery, mode])
 
   async function pollUntilReady() {
     setLoading(true)
@@ -117,9 +140,6 @@ export default function WeatherForecast() {
         const resp = await fetch('/api/weather/ready')
         const data = await resp.json()
         if (data.ready) {
-          // FIX: only load forecast here — do NOT also call loadForecast from
-          // handleDistrictChange on initial render. Selected is already 'Thanjavur'
-          // and this is the only trigger needed on startup.
           loadForecast({ district: 'Thanjavur' })
           return
         }
@@ -145,9 +165,6 @@ export default function WeatherForecast() {
   function handleDistrictChange(e) {
     const d = e.target.value
     setSelected(d)
-    // FIX: only fire if model is confirmed ready — avoids a race where the
-    // user picks a district before pollUntilReady finishes and sends a
-    // duplicate request alongside the poll's loadForecast call.
     if (d && !loading) loadForecast({ district: d })
   }
 
@@ -175,7 +192,7 @@ export default function WeatherForecast() {
       <div className="flex flex-col gap-3">
         <div className="flex rounded-xl overflow-hidden border border-gray-200">
           {[['district','🗺️ District'],['gps','📍 GPS'],['search','🔍 Search']].map(([m, label]) => (
-            <button key={m} onClick={() => { setMode(m); setError(null) }}
+            <button key={m} onClick={() => { setMode(m); setError(null); setSearchResults([]) }}
               className={`flex-1 py-2 text-sm font-medium transition-colors
                 ${mode === m ? 'bg-primary text-white' : 'bg-white text-gray-600 hover:bg-green-50'}`}>
               {label}
@@ -199,9 +216,12 @@ export default function WeatherForecast() {
 
         {mode === 'search' && (
           <div className="relative">
-            <input value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
+            <input
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
               placeholder="Search any location..."
-              className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-primary" />
+              className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-primary"
+            />
             {searching && <p className="text-xs text-gray-400 mt-1 px-1">Searching...</p>}
             {searchResults.length > 0 && (
               <div className="absolute z-10 w-full bg-white border border-gray-200 rounded-xl shadow-lg mt-1 overflow-hidden">
