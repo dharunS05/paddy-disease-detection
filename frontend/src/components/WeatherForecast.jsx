@@ -215,6 +215,11 @@ export default function WeatherForecast() {
           <span className="text-sm font-medium">Loading forecast...</span>
         </div>
       )}
+      {forecast.is_fallback && (
+  <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-2 text-xs text-yellow-700">
+    ⚠️ Live weather unavailable — showing estimated data
+  </div>
+)}
 
       {forecast && !loading && (
         <>
