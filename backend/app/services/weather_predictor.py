@@ -1,10 +1,10 @@
 import asyncio
+import time
 import numpy as np
 import pandas as pd
 import httpx
 import openmeteo_requests
 import requests_cache
-from retry_requests import retry
 
 from app.services.weather_info import (
     FEATURE_COLS, BASE_FEATURE_COLS, DISTRICT_COLS,
@@ -20,21 +20,23 @@ DAILY_VARS = [
     "relative_humidity_2m_mean", "precipitation_sum", "wind_speed_10m_max",
 ]
 
-# --- Official Open-Meteo SDK client -------------------------------------------
-# /tmp is always writable on HuggingFace Spaces — avoids silent cache failure
-_cache_session = requests_cache.CachedSession('/tmp/.om_cache', expire_after=21600)
-# Only retry on 429 (rate-limit). Do NOT retry 502 — it spams the API and
-# triggers "too many concurrent requests" which caused the original crash.
-_retry_session = retry(
-    _cache_session,
-    retries=2,
-    backoff_factor=1.0,
-)
-_openmeteo = openmeteo_requests.Client(session=_retry_session)
+# --- Cache only, NO retry wrapper (retry was causing burst requests) ----------
+try:
+    _cache_session = requests_cache.CachedSession('/tmp/.om_cache', expire_after=21600)
+    _cache_session.request("GET", "https://example.com", timeout=0.01)  # test writability
+except Exception:
+    _cache_session = requests_cache.CachedSession(backend='memory', expire_after=21600)
 
-# Semaphore: max 1 live Open-Meteo call at a time.
-# Cached responses (same coords within 6h) skip the network entirely.
+_openmeteo = openmeteo_requests.Client(session=_cache_session)
+
+# Semaphore: strictly 1 network call at a time across all concurrent requests
 _api_semaphore = asyncio.Semaphore(1)
+
+# In-memory forecast cache: {(lat, lon): (timestamp, dataframe)}
+# Secondary safety net — even if requests_cache fails, same-coord calls
+# within 6 hours are served from memory without touching the API.
+_mem_cache: dict = {}
+_MEM_CACHE_TTL = 21600  # 6 hours
 # ------------------------------------------------------------------------------
 
 
@@ -57,24 +59,35 @@ async def geocode(query: str) -> list:
 
 
 def _fetch_forecast_sync(lat: float, lon: float) -> pd.DataFrame:
-    """
-    Synchronous Open-Meteo fetch via official SDK (FlatBuffers, not JSON).
-    daily is passed as a comma-joined string to avoid repeated ?daily= params
-    which caused 502 errors on the free-tier endpoint.
-    """
+    """No retry library — retries manually with a 2s delay, only once,
+    and only on network errors. Never retries 429/502 (would spam the API)."""
     params = {
         "latitude":      lat,
         "longitude":     lon,
-        "daily":         ",".join(DAILY_VARS),  # single param, not repeated keys
+        "daily":         ",".join(DAILY_VARS),
         "forecast_days": 7,
         "timezone":      "auto",
     }
 
-    responses = _openmeteo.weather_api(FORECAST_URL, params=params)
-    response  = responses[0]
-    daily     = response.Daily()
+    last_exc = None
+    for attempt in range(2):
+        try:
+            responses = _openmeteo.weather_api(FORECAST_URL, params=params)
+            break
+        except Exception as e:
+            err_str = str(e)
+            # Do NOT retry on rate-limit or server errors — only network errors
+            if "429" in err_str or "502" in err_str or "Too many" in err_str:
+                raise RuntimeError(f"Open-Meteo API error: {e}") from e
+            last_exc = e
+            if attempt == 0:
+                time.sleep(2)
+    else:
+        raise RuntimeError(f"Open-Meteo unreachable: {last_exc}") from last_exc
 
-    # Order matches DAILY_VARS: mean(0), max(1), min(2), humidity(3), rain(4), wind(5)
+    response = responses[0]
+    daily    = response.Daily()
+
     daily_data = {
         "date": pd.date_range(
             start=pd.to_datetime(daily.Time(),    unit="s", utc=True),
@@ -91,19 +104,32 @@ def _fetch_forecast_sync(lat: float, lon: float) -> pd.DataFrame:
     }
 
     df = pd.DataFrame(data=daily_data)
-    # Remove timezone so .dt.month / .dt.dayofyear work without warnings
     df["date"] = df["date"].dt.tz_localize(None)
     return df.ffill().fillna(0)
 
 
 async def fetch_forecast(lat: float, lon: float) -> pd.DataFrame:
-    """
-    Async wrapper: runs sync SDK in a thread pool (never blocks event loop).
-    Semaphore queues callers so only one hits the network at a time.
-    """
+    # Check in-memory cache first — bypasses network entirely
+    cache_key = (round(lat, 3), round(lon, 3))
+    now = time.time()
+    if cache_key in _mem_cache:
+        cached_time, cached_df = _mem_cache[cache_key]
+        if now - cached_time < _MEM_CACHE_TTL:
+            return cached_df
+
+    # Semaphore: only 1 thread hits the API at a time
     async with _api_semaphore:
+        # Re-check cache after acquiring semaphore — another coroutine may have
+        # just fetched and cached the same coords while we were waiting
+        if cache_key in _mem_cache:
+            cached_time, cached_df = _mem_cache[cache_key]
+            if now - cached_time < _MEM_CACHE_TTL:
+                return cached_df
+
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _fetch_forecast_sync, lat, lon)
+        df = await loop.run_in_executor(None, _fetch_forecast_sync, lat, lon)
+        _mem_cache[cache_key] = (time.time(), df)
+        return df
 
 
 def _add_features(df: pd.DataFrame, district_name: str = None) -> pd.DataFrame:
@@ -125,15 +151,12 @@ def _add_features(df: pd.DataFrame, district_name: str = None) -> pd.DataFrame:
     if matched and matched in DISTRICT_COLS:
         df[matched] = 1
     else:
-        df[DISTRICT_COLS[0]] = 1  # default Thanjavur
+        df[DISTRICT_COLS[0]] = 1
 
     return df
 
 
 def _predict_ensemble(df: pd.DataFrame) -> list:
-    # Models are guaranteed loaded before this is called (main.py lifespan).
-    # WeatherModelLoader.load() is NOT called here — calling it here caused a
-    # double-load race condition with the background thread in main.py lifespan.
     scaler    = WeatherModelLoader.scaler
     xgb_model = WeatherModelLoader.xgb_model
     tcn_model = WeatherModelLoader.tcn_model
