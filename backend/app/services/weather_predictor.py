@@ -21,9 +21,13 @@ DAILY_VARS = [
 ]
 
 # --- Official Open-Meteo SDK client (sync, with cache + auto-retry) ----------
-_cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
-_retry_session = retry(_cache_session, retries=5, backoff_factor=0.2)
+# Cache for 6 hours — reduces API hits significantly
+_cache_session = requests_cache.CachedSession('.cache', expire_after=21600)
+_retry_session = retry(_cache_session, retries=3, backoff_factor=0.5)
 _openmeteo    = openmeteo_requests.Client(session=_retry_session)
+
+# Semaphore: only 1 real API call at a time to avoid "too many concurrent requests"
+_api_semaphore = asyncio.Semaphore(1)
 # -----------------------------------------------------------------------------
 
 
@@ -93,10 +97,12 @@ def _fetch_forecast_sync(lat: float, lon: float) -> pd.DataFrame:
 async def fetch_forecast(lat: float, lon: float) -> pd.DataFrame:
     """
     Async wrapper — runs the sync SDK call in a thread pool so FastAPI
-    event loop is never blocked.
+    event loop is never blocked. Semaphore ensures only 1 live API call
+    at a time (cached calls bypass the semaphore instantly).
     """
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _fetch_forecast_sync, lat, lon)
+    async with _api_semaphore:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _fetch_forecast_sync, lat, lon)
 
 
 def _add_features(df: pd.DataFrame, district_name: str = None) -> pd.DataFrame:
