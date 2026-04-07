@@ -59,8 +59,11 @@ async def geocode(query: str) -> list:
 
 
 def _fetch_forecast_sync(lat: float, lon: float) -> pd.DataFrame:
-    """No retry library — retries manually with a 2s delay, only once,
-    and only on network errors. Never retries 429/502 (would spam the API)."""
+    """
+    Primary: Open-Meteo SDK (flatbuffers).
+    Fallback: plain httpx JSON request — different endpoint, no flatbuffers,
+    avoids the 502 that only hits the flatbuffers format handler.
+    """
     params = {
         "latitude":      lat,
         "longitude":     lon,
@@ -69,42 +72,57 @@ def _fetch_forecast_sync(lat: float, lon: float) -> pd.DataFrame:
         "timezone":      "auto",
     }
 
-    last_exc = None
-    for attempt in range(2):
-        try:
-            responses = _openmeteo.weather_api(FORECAST_URL, params=params)
-            break
-        except Exception as e:
-            err_str = str(e)
-            # Do NOT retry on rate-limit or server errors — only network errors
-            if "429" in err_str or "502" in err_str or "Too many" in err_str:
-                raise RuntimeError(f"Open-Meteo API error: {e}") from e
-            last_exc = e
-            if attempt == 0:
-                time.sleep(2)
-    else:
-        raise RuntimeError(f"Open-Meteo unreachable: {last_exc}") from last_exc
+    # --- Try SDK first (uses flatbuffers format) ---
+    try:
+        responses = _openmeteo.weather_api(FORECAST_URL, params=params)
+        response  = responses[0]
+        daily     = response.Daily()
 
-    response = responses[0]
-    daily    = response.Daily()
+        daily_data = {
+            "date": pd.date_range(
+                start=pd.to_datetime(daily.Time(),    unit="s", utc=True),
+                end=  pd.to_datetime(daily.TimeEnd(), unit="s", utc=True),
+                freq= pd.Timedelta(seconds=daily.Interval()),
+                inclusive="left",
+            ),
+            "temperature_mean": daily.Variables(0).ValuesAsNumpy(),
+            "temperature_max":  daily.Variables(1).ValuesAsNumpy(),
+            "temperature_min":  daily.Variables(2).ValuesAsNumpy(),
+            "humidity":         daily.Variables(3).ValuesAsNumpy(),
+            "rainfall":         daily.Variables(4).ValuesAsNumpy(),
+            "wind_speed":       daily.Variables(5).ValuesAsNumpy(),
+        }
+        df = pd.DataFrame(data=daily_data)
+        df["date"] = df["date"].dt.tz_localize(None)
+        return df.ffill().fillna(0)
 
-    daily_data = {
-        "date": pd.date_range(
-            start=pd.to_datetime(daily.Time(),    unit="s", utc=True),
-            end=  pd.to_datetime(daily.TimeEnd(), unit="s", utc=True),
-            freq= pd.Timedelta(seconds=daily.Interval()),
-            inclusive="left",
-        ),
-        "temperature_mean": daily.Variables(0).ValuesAsNumpy(),
-        "temperature_max":  daily.Variables(1).ValuesAsNumpy(),
-        "temperature_min":  daily.Variables(2).ValuesAsNumpy(),
-        "humidity":         daily.Variables(3).ValuesAsNumpy(),
-        "rainfall":         daily.Variables(4).ValuesAsNumpy(),
-        "wind_speed":       daily.Variables(5).ValuesAsNumpy(),
-    }
+    except Exception as sdk_err:
+        pass  # fall through to JSON fallback
 
-    df = pd.DataFrame(data=daily_data)
-    df["date"] = df["date"].dt.tz_localize(None)
+    # --- Fallback: plain JSON via httpx, no flatbuffers ---
+    import httpx as _httpx
+    try:
+        with _httpx.Client(timeout=15) as client:
+            r = client.get(FORECAST_URL, params={**params, "daily": DAILY_VARS})
+            r.raise_for_status()
+            data = r.json()
+    except Exception as json_err:
+        raise RuntimeError(
+            f"Both SDK and JSON fallback failed.\n"
+            f"SDK error: {sdk_err}\n"
+            f"JSON error: {json_err}"
+        )
+
+    daily = data["daily"]
+    df = pd.DataFrame({
+        "date":             pd.to_datetime(daily["time"]),
+        "temperature_mean": daily["temperature_2m_mean"],
+        "temperature_max":  daily["temperature_2m_max"],
+        "temperature_min":  daily["temperature_2m_min"],
+        "humidity":         daily["relative_humidity_2m_mean"],
+        "rainfall":         daily["precipitation_sum"],
+        "wind_speed":       daily["wind_speed_10m_max"],
+    })
     return df.ffill().fillna(0)
 
 
