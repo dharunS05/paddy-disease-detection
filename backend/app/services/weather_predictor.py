@@ -346,7 +346,10 @@ async def get_forecast(
     when live data could not be retrieved.
     """
     df       = await fetch_forecast(lat, lon)
-    is_fall  = df["date"].iloc[0].date() == pd.Timestamp.now().normalize().date() and df["rainfall"].sum() == 0.0
+    is_fall = bool(
+    df["date"].iloc[0].date() == pd.Timestamp.now().normalize().date()
+    and float(df["rainfall"].sum()) == 0.0
+)
     df       = _add_features(df, district_name=district_name)
     forecast = _predict_ensemble(df)
 
