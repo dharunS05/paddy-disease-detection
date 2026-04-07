@@ -35,15 +35,25 @@ async def geocode(query: str) -> list:
 
 
 async def fetch_forecast(lat: float, lon: float) -> pd.DataFrame:
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(FORECAST_URL, params={
-            "latitude": lat, "longitude": lon,
-            "daily": DAILY_VARS,
-            "forecast_days": 7,
-            "timezone": "auto",
-        })
-        r.raise_for_status()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+        for attempt in range(3):
+            try:
+                r = await client.get(FORECAST_URL, params={
+                    "latitude": lat, "longitude": lon,
+                    "daily": DAILY_VARS,
+                    "forecast_days": 7,
+                    "timezone": "auto",
+                })
+                r.raise_for_status()
+                break
+            except (httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+                if attempt == 2:
+                    raise RuntimeError(
+                        "Weather API unreachable after 3 attempts. "
+                        "Check network/firewall for outbound HTTPS to api.open-meteo.com"
+                    ) from e
         data = r.json()
+    # ... rest unchanged
 
     daily = data["daily"]
     df = pd.DataFrame({

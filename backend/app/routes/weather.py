@@ -39,17 +39,24 @@ async def weather_forecast(
     lon:      Optional[float] = Query(None),
     location: Optional[str]   = Query(None),
 ):
-    # Return 503 if model still loading
     if not WeatherModelLoader.xgb_model:
         raise HTTPException(status_code=503, detail="Weather model still loading, please wait...")
 
-    if district:
-        if district not in DISTRICTS:
-            raise HTTPException(status_code=404, detail="District not found.")
-        d = DISTRICTS[district]
-        return await get_forecast(d["lat"], d["lon"], district, district_name=district)
-    elif lat is not None and lon is not None:
-        name = location or f"{lat:.4f}, {lon:.4f}"
-        return await get_forecast(lat, lon, name, district_name=None)
-    else:
-        raise HTTPException(status_code=400, detail="Provide 'district' or 'lat'+'lon'")
+    try:
+        if district:
+            if district not in DISTRICTS:
+                raise HTTPException(status_code=404, detail="District not found.")
+            d = DISTRICTS[district]
+            return await get_forecast(d["lat"], d["lon"], district, district_name=district)
+        elif lat is not None and lon is not None:
+            name = location or f"{lat:.4f}, {lon:.4f}"
+            return await get_forecast(lat, lon, name, district_name=None)
+        else:
+            raise HTTPException(status_code=400, detail="Provide 'district' or 'lat'+'lon'")
+
+    except HTTPException:
+        raise  # re-raise FastAPI exceptions as-is
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Forecast failed: {e}")
