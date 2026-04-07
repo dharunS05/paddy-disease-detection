@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from functools import lru_cache
 from typing import Optional
@@ -47,8 +48,8 @@ DAILY_VARS = (
 
 # Retry / timeout knobs
 MAX_RETRIES      = 3          # total attempts (1 original + 2 retries)
-BASE_BACKOFF_S   = 1.5        # seconds before first retry
-BACKOFF_FACTOR   = 2.0        # multiplier per attempt
+BASE_BACKOFF_S   = 3.0        # seconds before first retry (increased to avoid 429)
+BACKOFF_FACTOR   = 3.0        # multiplier per attempt → waits: 3s, 9s
 CONNECT_TIMEOUT  = 8.0        # seconds to establish TCP connection
 READ_TIMEOUT     = 20.0       # seconds to receive full response
 
@@ -131,24 +132,25 @@ def _fallback_dataframe() -> pd.DataFrame:
     })
 
 
-async def fetch_forecast(lat: float, lon: float) -> pd.DataFrame:
+async def fetch_forecast(lat: float, lon: float) -> tuple[pd.DataFrame, bool]:
     """
     Fetch 7-day daily forecast from Open-Meteo.
 
     Strategy
     --------
     1. Return cached data if still fresh.
-    2. Try the API up to MAX_RETRIES times with exponential back-off.
-    3. On total failure: log error and return a safe fallback DataFrame.
+    2. Try the API up to MAX_RETRIES times with exponential back-off + jitter.
+    3. On total failure: serve stale cache or safe fallback DataFrame.
 
-    Raises
-    ------
+    Returns
+    -------
+    (df, is_fallback) — is_fallback=True when live data could not be fetched.
     Never raises — always returns a valid DataFrame.
     """
     key    = _cache_key(lat, lon)
     cached = _get_cached(key)
     if cached is not None:
-        return cached
+        return cached, False   # ← fresh cache = not fallback
 
     timeout = httpx.Timeout(connect=CONNECT_TIMEOUT, read=READ_TIMEOUT, write=5.0, pool=5.0)
     params  = {
@@ -182,7 +184,7 @@ async def fetch_forecast(lat: float, lon: float) -> pd.DataFrame:
 
             _set_cache(key, df)
             log.info("Weather fetch OK for (%.4f, %.4f) on attempt %d", lat, lon, attempt)
-            return df
+            return df, False   # ← live data = not fallback
 
         except httpx.TimeoutException as exc:
             last_exc = exc
@@ -214,9 +216,10 @@ async def fetch_forecast(lat: float, lon: float) -> pd.DataFrame:
             )
 
         if attempt < MAX_RETRIES:
-            wait = BASE_BACKOFF_S * (BACKOFF_FACTOR ** (attempt - 1))
-            log.info("Retrying in %.1fs ...", wait)
-            await asyncio.sleep(wait)
+            wait   = BASE_BACKOFF_S * (BACKOFF_FACTOR ** (attempt - 1))
+            jitter = random.uniform(0.5, 1.5)
+            log.info("Retrying in %.1fs (with jitter) ...", wait * jitter)
+            await asyncio.sleep(wait * jitter)
 
     # All retries exhausted – use stale cache if available, else fallback
     stale = _forecast_cache.get(key)
@@ -225,13 +228,13 @@ async def fetch_forecast(lat: float, lon: float) -> pd.DataFrame:
             "All retries failed for (%.4f, %.4f) – serving STALE cache. Last error: %s",
             lat, lon, last_exc,
         )
-        return stale[1].copy()
+        return stale[1].copy(), True   # ← stale = is_fallback
 
     log.error(
         "All retries failed for (%.4f, %.4f) – serving FALLBACK data. Last error: %s",
         lat, lon, last_exc,
     )
-    return _fallback_dataframe()
+    return _fallback_dataframe(), True   # ← fallback = is_fallback
 
 
 # ---------------------------------------------------------------------------
@@ -345,11 +348,7 @@ async def get_forecast(
     The `is_fallback` flag in the response lets the frontend show a banner
     when live data could not be retrieved.
     """
-    df       = await fetch_forecast(lat, lon)
-    is_fall = bool(
-    df["date"].iloc[0].date() == pd.Timestamp.now().normalize().date()
-    and float(df["rainfall"].sum()) == 0.0
-)
+    df, is_fallback = await fetch_forecast(lat, lon)   # ← unpack (df, is_fallback)
     df       = _add_features(df, district_name=district_name)
     forecast = _predict_ensemble(df)
 
@@ -357,6 +356,6 @@ async def get_forecast(
         "location":    location_name,
         "lat":         lat,
         "lon":         lon,
-        "is_fallback": is_fall,   # UI can show "⚠️ Using estimated data"
+        "is_fallback": bool(is_fallback),   # ← native Python bool, safe for JSON
         "forecast":    forecast,
     }
