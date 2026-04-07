@@ -13,13 +13,19 @@ from app.routes.weather import router as weather_router
 
 
 def _load_all_models():
+    """
+    Loads both models in a single background thread.
+    FIX: WeatherModelLoader.load() is called ONLY here.
+    It was previously also called inside _predict_ensemble() in weather_predictor.py
+    which caused a double-load race condition — two threads loading the same model
+    simultaneously on the first forecast request.
+    """
     ModelLoader.load()
     WeatherModelLoader.load()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load both models in background thread — app starts immediately
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, _load_all_models)
     yield

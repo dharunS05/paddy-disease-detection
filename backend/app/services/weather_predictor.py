@@ -20,18 +20,25 @@ DAILY_VARS = [
     "relative_humidity_2m_mean", "precipitation_sum", "wind_speed_10m_max",
 ]
 
-# --- Official Open-Meteo SDK client (sync, with cache + auto-retry) ----------
-# Cache for 6 hours — reduces API hits significantly
-_cache_session = requests_cache.CachedSession('.cache', expire_after=21600)
-_retry_session = retry(_cache_session, retries=3, backoff_factor=0.5)
-_openmeteo    = openmeteo_requests.Client(session=_retry_session)
+# --- Official Open-Meteo SDK client -------------------------------------------
+# /tmp is always writable on HuggingFace Spaces — avoids silent cache failure
+_cache_session = requests_cache.CachedSession('/tmp/.om_cache', expire_after=21600)
+# Only retry on 429 (rate-limit). Do NOT retry 502 — it spams the API and
+# triggers "too many concurrent requests" which caused the original crash.
+_retry_session = retry(
+    _cache_session,
+    retries=2,
+    backoff_factor=1.0,
+    status_forcelist=[429],
+)
+_openmeteo = openmeteo_requests.Client(session=_retry_session)
 
-# Semaphore: only 1 real API call at a time to avoid "too many concurrent requests"
+# Semaphore: max 1 live Open-Meteo call at a time.
+# Cached responses (same coords within 6h) skip the network entirely.
 _api_semaphore = asyncio.Semaphore(1)
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 
-# geocode still uses httpx (geocoding API works fine with JSON)
 async def geocode(query: str) -> list:
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(GEOCODE_URL, params={"name": query, "count": 5, "language": "en"})
@@ -52,25 +59,23 @@ async def geocode(query: str) -> list:
 
 def _fetch_forecast_sync(lat: float, lon: float) -> pd.DataFrame:
     """
-    Calls Open-Meteo via the official SDK (synchronous).
-    Uses FlatBuffers under the hood — more reliable than raw JSON endpoint.
-    Cache: 1 hour. Retries: 5 with exponential backoff.
+    Synchronous Open-Meteo fetch via official SDK (FlatBuffers, not JSON).
+    daily is passed as a comma-joined string to avoid repeated ?daily= params
+    which caused 502 errors on the free-tier endpoint.
     """
     params = {
-        "latitude":     lat,
-        "longitude":    lon,
-        "daily":        DAILY_VARS,   # SDK accepts a list directly
+        "latitude":      lat,
+        "longitude":     lon,
+        "daily":         ",".join(DAILY_VARS),  # single param, not repeated keys
         "forecast_days": 7,
-        "timezone":     "auto",
+        "timezone":      "auto",
     }
 
     responses = _openmeteo.weather_api(FORECAST_URL, params=params)
     response  = responses[0]
+    daily     = response.Daily()
 
-    daily = response.Daily()
-
-    # Variables are returned in the same order as DAILY_VARS
-    # DAILY_VARS = [mean, max, min, humidity, rainfall, wind_speed]
+    # Order matches DAILY_VARS: mean(0), max(1), min(2), humidity(3), rain(4), wind(5)
     daily_data = {
         "date": pd.date_range(
             start=pd.to_datetime(daily.Time(),    unit="s", utc=True),
@@ -87,18 +92,15 @@ def _fetch_forecast_sync(lat: float, lon: float) -> pd.DataFrame:
     }
 
     df = pd.DataFrame(data=daily_data)
-
-    # Strip timezone so downstream .dt.month etc. work without warnings
+    # Remove timezone so .dt.month / .dt.dayofyear work without warnings
     df["date"] = df["date"].dt.tz_localize(None)
-
     return df.ffill().fillna(0)
 
 
 async def fetch_forecast(lat: float, lon: float) -> pd.DataFrame:
     """
-    Async wrapper — runs the sync SDK call in a thread pool so FastAPI
-    event loop is never blocked. Semaphore ensures only 1 live API call
-    at a time (cached calls bypass the semaphore instantly).
+    Async wrapper: runs sync SDK in a thread pool (never blocks event loop).
+    Semaphore queues callers so only one hits the network at a time.
     """
     async with _api_semaphore:
         loop = asyncio.get_event_loop()
@@ -130,7 +132,9 @@ def _add_features(df: pd.DataFrame, district_name: str = None) -> pd.DataFrame:
 
 
 def _predict_ensemble(df: pd.DataFrame) -> list:
-    WeatherModelLoader.load()
+    # Models are guaranteed loaded before this is called (main.py lifespan).
+    # WeatherModelLoader.load() is NOT called here — calling it here caused a
+    # double-load race condition with the background thread in main.py lifespan.
     scaler    = WeatherModelLoader.scaler
     xgb_model = WeatherModelLoader.xgb_model
     tcn_model = WeatherModelLoader.tcn_model

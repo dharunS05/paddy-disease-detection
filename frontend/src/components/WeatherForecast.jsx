@@ -21,14 +21,12 @@ function WeatherCard({ day, isToday }) {
     <div className={`rounded-2xl border p-4 flex flex-col gap-3 min-w-[160px]
       ${isToday ? 'bg-primary text-white border-primary shadow-lg scale-105' : 'bg-white border-gray-100 shadow-sm'}`}>
 
-      {/* Date */}
       <div>
         <p className={`text-xs font-bold uppercase tracking-wide ${isToday ? 'text-green-200' : 'text-gray-400'}`}>
           {label}
         </p>
       </div>
 
-      {/* Weather info */}
       {temp && (
         <div className="space-y-1">
           <div className="flex items-center gap-2">
@@ -50,15 +48,11 @@ function WeatherCard({ day, isToday }) {
         </div>
       )}
 
-      {/* Overall risk badge */}
       <div className={`flex items-center gap-1 text-xs font-semibold rounded-lg px-2 py-1 w-fit
-        ${isToday
-          ? 'bg-white/20 text-white'
-          : RISK_STYLE[maxRisk]}`}>
+        ${isToday ? 'bg-white/20 text-white' : RISK_STYLE[maxRisk]}`}>
         {RISK_ICON[maxRisk]} {maxRisk} Risk
       </div>
 
-      {/* Per-disease risks */}
       <div className="space-y-1">
         {DISEASES.map(d => {
           const r = day.diseases[d]
@@ -102,37 +96,48 @@ export default function WeatherForecast() {
   const [searching, setSearching]         = useState(false)
   const searchTimer                       = useRef(null)
 
- useEffect(() => {
-  getDistricts().then(setDistricts).catch(() => {})
-  pollUntilReady()
-}, [])
+  // FIX: track whether pollUntilReady has already triggered a forecast load.
+  // Without this, React StrictMode (dev) runs the effect twice → 2 simultaneous
+  // API calls → "too many concurrent requests" on Open-Meteo.
+  const forecastTriggered = useRef(false)
 
-async function pollUntilReady() {
-  setLoading(true)
-  // Poll /api/weather/ready every 3 seconds until model loaded
-  for (let i = 0; i < 20; i++) {
-    try {
-      const resp = await fetch('/api/weather/ready')
-      const data = await resp.json()
-      if (data.ready) {
-        loadForecast({ district: 'Thanjavur' })
-        return
-      }
-    } catch {}
-    await new Promise(r => setTimeout(r, 3000))
+  useEffect(() => {
+    getDistricts().then(setDistricts).catch(() => {})
+    // Guard: only start polling once even if StrictMode mounts twice
+    if (!forecastTriggered.current) {
+      forecastTriggered.current = true
+      pollUntilReady()
+    }
+  }, [])
+
+  async function pollUntilReady() {
+    setLoading(true)
+    for (let i = 0; i < 20; i++) {
+      try {
+        const resp = await fetch('/api/weather/ready')
+        const data = await resp.json()
+        if (data.ready) {
+          // FIX: only load forecast here — do NOT also call loadForecast from
+          // handleDistrictChange on initial render. Selected is already 'Thanjavur'
+          // and this is the only trigger needed on startup.
+          loadForecast({ district: 'Thanjavur' })
+          return
+        }
+      } catch {}
+      await new Promise(r => setTimeout(r, 3000))
+    }
+    setError('Weather model took too long to load. Please refresh.')
+    setLoading(false)
   }
-  setError('Weather model took too long to load. Please refresh.')
-  setLoading(false)
-}
 
   async function loadForecast(params) {
-    setLoading(true); setError(null)
+    setLoading(true)
+    setError(null)
     try {
       const data = await getWeatherForecast(params)
-      // merge weather info into forecast days
       setForecast(data)
     } catch (e) {
-      setError(e?.response?.data?.detail || 'Forecast failed')
+      setError(e?.response?.data?.detail || e?.message || 'Forecast failed')
     }
     setLoading(false)
   }
@@ -140,7 +145,10 @@ async function pollUntilReady() {
   function handleDistrictChange(e) {
     const d = e.target.value
     setSelected(d)
-    if (d) loadForecast({ district: d })
+    // FIX: only fire if model is confirmed ready — avoids a race where the
+    // user picks a district before pollUntilReady finishes and sends a
+    // duplicate request alongside the poll's loadForecast call.
+    if (d && !loading) loadForecast({ district: d })
   }
 
   function handleGPS() {
@@ -153,7 +161,8 @@ async function pollUntilReady() {
   }
 
   function handleSearchSelect(r) {
-    setSearchQuery(r.name); setSearchResults([])
+    setSearchQuery(r.name)
+    setSearchResults([])
     loadForecast({ lat: r.lat, lon: r.lon, location: r.name })
   }
 
@@ -211,19 +220,18 @@ async function pollUntilReady() {
       {error && <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-sm text-red-600">⚠️ {error}</div>}
 
       {loading && (
-          <div className="flex flex-col items-center justify-center gap-2 py-10 text-primary">
+        <div className="flex flex-col items-center justify-center gap-2 py-10 text-primary">
           <svg className="animate-spin h-6 w-6" viewBox="0 0 24 24" fill="none">
-      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
-    </svg>
-    <p className="text-sm font-medium">Loading weather model...</p>
-    <p className="text-xs text-gray-400">Downloading from HuggingFace, please wait</p>
-  </div>
-)}
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+          </svg>
+          <p className="text-sm font-medium">Loading weather model...</p>
+          <p className="text-xs text-gray-400">Downloading from HuggingFace, please wait</p>
+        </div>
+      )}
 
       {forecast && !loading && (
         <>
-          {/* Location + model info */}
           <div className="flex items-center justify-between">
             <div>
               <p className="font-semibold text-gray-800">📍 {forecast.location}</p>
@@ -236,7 +244,6 @@ async function pollUntilReady() {
             )}
           </div>
 
-          {/* Today highlight */}
           {today && today.weather && (
             <div className="bg-gradient-to-r from-primary to-green-400 rounded-2xl p-5 text-white">
               <p className="text-green-200 text-xs font-semibold uppercase tracking-wide mb-2">Today's Overview</p>
@@ -254,7 +261,6 @@ async function pollUntilReady() {
                   <p className="text-sm">💨 Wind: {Math.round(today.weather.wind_speed)} km/h</p>
                 </div>
               </div>
-              {/* Today disease risks */}
               <div className="mt-4 grid grid-cols-4 gap-2">
                 {DISEASES.map(d => (
                   <div key={d} className="bg-white/20 rounded-xl p-2 text-center">
@@ -271,7 +277,6 @@ async function pollUntilReady() {
             </div>
           )}
 
-          {/* 7-day scroll */}
           <div>
             <p className="text-sm font-semibold text-gray-600 mb-3">📅 7-Day Forecast</p>
             <div className="flex gap-3 overflow-x-auto pb-2">
@@ -281,7 +286,6 @@ async function pollUntilReady() {
             </div>
           </div>
 
-          {/* Legend */}
           <div className="flex gap-4 text-xs text-gray-400 px-1">
             <span>🟢 Low</span><span>🟡 Medium</span><span>🔴 High</span>
             <span className="ml-auto">% = model confidence</span>
