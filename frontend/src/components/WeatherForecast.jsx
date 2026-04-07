@@ -21,12 +21,14 @@ function WeatherCard({ day, isToday }) {
     <div className={`rounded-2xl border p-4 flex flex-col gap-3 min-w-[160px]
       ${isToday ? 'bg-primary text-white border-primary shadow-lg scale-105' : 'bg-white border-gray-100 shadow-sm'}`}>
 
+      {/* Date */}
       <div>
         <p className={`text-xs font-bold uppercase tracking-wide ${isToday ? 'text-green-200' : 'text-gray-400'}`}>
           {label}
         </p>
       </div>
 
+      {/* Weather info */}
       {temp && (
         <div className="space-y-1">
           <div className="flex items-center gap-2">
@@ -48,11 +50,15 @@ function WeatherCard({ day, isToday }) {
         </div>
       )}
 
+      {/* Overall risk badge */}
       <div className={`flex items-center gap-1 text-xs font-semibold rounded-lg px-2 py-1 w-fit
-        ${isToday ? 'bg-white/20 text-white' : RISK_STYLE[maxRisk]}`}>
+        ${isToday
+          ? 'bg-white/20 text-white'
+          : RISK_STYLE[maxRisk]}`}>
         {RISK_ICON[maxRisk]} {maxRisk} Risk
       </div>
 
+      {/* Per-disease risks */}
       <div className="space-y-1">
         {DISEASES.map(d => {
           const r = day.diseases[d]
@@ -96,68 +102,33 @@ export default function WeatherForecast() {
   const [searching, setSearching]         = useState(false)
   const searchTimer                       = useRef(null)
 
-  const forecastTriggered = useRef(false)
-
   useEffect(() => {
-    getDistricts().then(setDistricts).catch(() => {})
-    if (!forecastTriggered.current) {
-      forecastTriggered.current = true
-      pollUntilReady()
-    }
+    getDistricts().then(d => {
+      setDistricts(d)
+      // Auto-load Thanjavur on mount
+      loadForecast({ district: 'Thanjavur' })
+    }).catch(() => {})
   }, [])
 
-  // FIX: wire up debounced search — previously searchTimer was declared but
-  // never used; the onChange only set state and never called searchLocation.
   useEffect(() => {
-    if (mode !== 'search') return
-    const query = searchQuery.trim()
-    if (query.length < 2) {
-      setSearchResults([])
-      return
-    }
-    // Debounce: clear previous timer, fire after 400 ms idle
+    if (mode !== 'search' || searchQuery.length < 2) { setSearchResults([]); return }
     clearTimeout(searchTimer.current)
     searchTimer.current = setTimeout(async () => {
       setSearching(true)
-      try {
-        const results = await searchLocation(query)
-        setSearchResults(results)
-      } catch {
-        setSearchResults([])
-      } finally {
-        setSearching(false)
-      }
-    }, 400)
-
-    // Cleanup on unmount or next keystroke
-    return () => clearTimeout(searchTimer.current)
+      try { setSearchResults(await searchLocation(searchQuery)) }
+      catch { setSearchResults([]) }
+      setSearching(false)
+    }, 500)
   }, [searchQuery, mode])
 
-  async function pollUntilReady() {
-    setLoading(true)
-    for (let i = 0; i < 20; i++) {
-      try {
-        const resp = await fetch('/api/weather/ready')
-        const data = await resp.json()
-        if (data.ready) {
-          loadForecast({ district: 'Thanjavur' })
-          return
-        }
-      } catch {}
-      await new Promise(r => setTimeout(r, 3000))
-    }
-    setError('Weather model took too long to load. Please refresh.')
-    setLoading(false)
-  }
-
   async function loadForecast(params) {
-    setLoading(true)
-    setError(null)
+    setLoading(true); setError(null)
     try {
       const data = await getWeatherForecast(params)
+      // merge weather info into forecast days
       setForecast(data)
     } catch (e) {
-      setError(e?.response?.data?.detail || e?.message || 'Forecast failed')
+      setError(e?.response?.data?.detail || 'Forecast failed')
     }
     setLoading(false)
   }
@@ -165,7 +136,7 @@ export default function WeatherForecast() {
   function handleDistrictChange(e) {
     const d = e.target.value
     setSelected(d)
-    if (d && !loading) loadForecast({ district: d })
+    if (d) loadForecast({ district: d })
   }
 
   function handleGPS() {
@@ -178,8 +149,7 @@ export default function WeatherForecast() {
   }
 
   function handleSearchSelect(r) {
-    setSearchQuery(r.name)
-    setSearchResults([])
+    setSearchQuery(r.name); setSearchResults([])
     loadForecast({ lat: r.lat, lon: r.lon, location: r.name })
   }
 
@@ -192,7 +162,7 @@ export default function WeatherForecast() {
       <div className="flex flex-col gap-3">
         <div className="flex rounded-xl overflow-hidden border border-gray-200">
           {[['district','🗺️ District'],['gps','📍 GPS'],['search','🔍 Search']].map(([m, label]) => (
-            <button key={m} onClick={() => { setMode(m); setError(null); setSearchResults([]) }}
+            <button key={m} onClick={() => { setMode(m); setError(null) }}
               className={`flex-1 py-2 text-sm font-medium transition-colors
                 ${mode === m ? 'bg-primary text-white' : 'bg-white text-gray-600 hover:bg-green-50'}`}>
               {label}
@@ -216,12 +186,9 @@ export default function WeatherForecast() {
 
         {mode === 'search' && (
           <div className="relative">
-            <input
-              value={searchQuery}
-              onChange={e => setSearchQuery(e.target.value)}
+            <input value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
               placeholder="Search any location..."
-              className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-primary"
-            />
+              className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-primary" />
             {searching && <p className="text-xs text-gray-400 mt-1 px-1">Searching...</p>}
             {searchResults.length > 0 && (
               <div className="absolute z-10 w-full bg-white border border-gray-200 rounded-xl shadow-lg mt-1 overflow-hidden">
@@ -240,18 +207,18 @@ export default function WeatherForecast() {
       {error && <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-sm text-red-600">⚠️ {error}</div>}
 
       {loading && (
-        <div className="flex flex-col items-center justify-center gap-2 py-10 text-primary">
-          <svg className="animate-spin h-6 w-6" viewBox="0 0 24 24" fill="none">
+        <div className="flex items-center justify-center gap-2 py-8 text-primary">
+          <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24" fill="none">
             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
           </svg>
-          <p className="text-sm font-medium">Loading weather model...</p>
-          <p className="text-xs text-gray-400">Downloading from HuggingFace, please wait</p>
+          <span className="text-sm font-medium">Loading forecast...</span>
         </div>
       )}
 
       {forecast && !loading && (
         <>
+          {/* Location + model info */}
           <div className="flex items-center justify-between">
             <div>
               <p className="font-semibold text-gray-800">📍 {forecast.location}</p>
@@ -264,6 +231,7 @@ export default function WeatherForecast() {
             )}
           </div>
 
+          {/* Today highlight */}
           {today && today.weather && (
             <div className="bg-gradient-to-r from-primary to-green-400 rounded-2xl p-5 text-white">
               <p className="text-green-200 text-xs font-semibold uppercase tracking-wide mb-2">Today's Overview</p>
@@ -281,6 +249,7 @@ export default function WeatherForecast() {
                   <p className="text-sm">💨 Wind: {Math.round(today.weather.wind_speed)} km/h</p>
                 </div>
               </div>
+              {/* Today disease risks */}
               <div className="mt-4 grid grid-cols-4 gap-2">
                 {DISEASES.map(d => (
                   <div key={d} className="bg-white/20 rounded-xl p-2 text-center">
@@ -297,6 +266,7 @@ export default function WeatherForecast() {
             </div>
           )}
 
+          {/* 7-day scroll */}
           <div>
             <p className="text-sm font-semibold text-gray-600 mb-3">📅 7-Day Forecast</p>
             <div className="flex gap-3 overflow-x-auto pb-2">
@@ -306,6 +276,7 @@ export default function WeatherForecast() {
             </div>
           </div>
 
+          {/* Legend */}
           <div className="flex gap-4 text-xs text-gray-400 px-1">
             <span>🟢 Low</span><span>🟡 Medium</span><span>🔴 High</span>
             <span className="ml-auto">% = model confidence</span>

@@ -4,7 +4,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 import os
-import asyncio
 
 from app.services.model_loader import ModelLoader
 from app.services.weather_model_loader import WeatherModelLoader
@@ -12,25 +11,10 @@ from app.routes.predict import router as predict_router
 from app.routes.weather import router as weather_router
 
 
-def _load_all_models():
-    """
-    Loads both models in a single background thread.
-    FIX: WeatherModelLoader.load() is called ONLY here.
-    It was previously also called inside _predict_ensemble() in weather_predictor.py
-    which caused a double-load race condition — two threads loading the same model
-    simultaneously on the first forecast request.
-    """
-    ModelLoader.load()
-    WeatherModelLoader.load()
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # FIXED: asyncio.get_event_loop().run_in_executor returns a Future that
-    # must be stored. Without storing it, Python garbage-collects it immediately
-    # and the thread never actually starts.
-    loop = asyncio.get_event_loop()
-    asyncio.ensure_future(loop.run_in_executor(None, _load_all_models))
+    ModelLoader.load()
+    WeatherModelLoader.load()
     yield
 
 
@@ -56,6 +40,7 @@ def health():
     }
 
 
+# Serve React frontend
 static_dir = "/app/static"
 if os.path.exists(static_dir):
     app.mount("/assets", StaticFiles(directory=f"{static_dir}/assets"), name="assets")
