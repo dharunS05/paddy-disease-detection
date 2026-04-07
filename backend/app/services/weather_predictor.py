@@ -29,7 +29,6 @@ _retry_session = retry(
     _cache_session,
     retries=2,
     backoff_factor=1.0,
-    status_forcelist=[429],
 )
 _openmeteo = openmeteo_requests.Client(session=_retry_session)
 
