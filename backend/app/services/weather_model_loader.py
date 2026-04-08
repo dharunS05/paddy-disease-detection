@@ -1,39 +1,75 @@
+"""
+weather_model_loader.py
+=======================
+Fixes applied:
+  • Full try/except around each model download — failure logged, not silently swallowed
+  • _loaded stays False on partial failure so next request retries cleanly
+  • Thread-safe: load() is safe to call from run_in_executor (no asyncio inside)
+  • HF_HOME env var respected for cache directory
+"""
+
 import os
+import logging
 import joblib
 import tensorflow as tf
 from huggingface_hub import hf_hub_download
 
+log = logging.getLogger(__name__)
+
 MODEL_REPO = "mlresearcher05/paddy-disease-detection"
 
+
 class WeatherModelLoader:
-    xgb_model  = None
-    tcn_model  = None
-    scaler     = None
-    _loaded    = False
+    xgb_model = None
+    tcn_model = None
+    scaler    = None
+    _loaded   = False
 
     @classmethod
-    def load(cls):
+    def load(cls) -> None:
         if cls._loaded:
             return
-        token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
 
-        def _dl(filename):
+        token     = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+        cache_dir = os.getenv("HF_HOME", "/app/models/hf_cache")
+
+        def _dl(filename: str) -> str:
             return hf_hub_download(
                 repo_id=MODEL_REPO,
                 filename=f"models/{filename}",
                 repo_type="model",
                 token=token,
-                cache_dir="/app/models/hf_cache",
+                cache_dir=cache_dir,
             )
 
-        print("[WeatherModelLoader] Loading XGBoost...")
-        cls.xgb_model = joblib.load(_dl("xgboost_model.pkl"))
+        try:
+            log.info("[WeatherModelLoader] Downloading XGBoost model...")
+            cls.xgb_model = joblib.load(_dl("xgboost_model.pkl"))
+            log.info("[WeatherModelLoader] XGBoost loaded OK.")
+        except Exception as e:
+            log.error("[WeatherModelLoader] Failed to load XGBoost: %s", e)
+            raise RuntimeError(f"XGBoost model load failed: {e}") from e
 
-        print("[WeatherModelLoader] Loading TCN...")
-        cls.tcn_model = tf.keras.models.load_model(_dl("paddy_tcn_multi_output.h5"), compile=False)
+        try:
+            log.info("[WeatherModelLoader] Downloading TCN/Conv1D model...")
+            cls.tcn_model = tf.keras.models.load_model(
+                _dl("paddy_tcn_multi_output.h5"), compile=False
+            )
+            log.info("[WeatherModelLoader] TCN model loaded OK.")
+        except Exception as e:
+            log.error("[WeatherModelLoader] Failed to load TCN model: %s", e)
+            cls.xgb_model = None  # reset partial state
+            raise RuntimeError(f"TCN model load failed: {e}") from e
 
-        print("[WeatherModelLoader] Loading scaler...")
-        cls.scaler = joblib.load(_dl("scaler.pkl"))
+        try:
+            log.info("[WeatherModelLoader] Downloading scaler...")
+            cls.scaler = joblib.load(_dl("scaler.pkl"))
+            log.info("[WeatherModelLoader] Scaler loaded OK.")
+        except Exception as e:
+            log.error("[WeatherModelLoader] Failed to load scaler: %s", e)
+            cls.xgb_model = None
+            cls.tcn_model = None
+            raise RuntimeError(f"Scaler load failed: {e}") from e
 
         cls._loaded = True
-        print("[WeatherModelLoader] All weather models loaded.")
+        log.info("[WeatherModelLoader] All weather models ready.")

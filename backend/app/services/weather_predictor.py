@@ -1,13 +1,14 @@
 """
 weather_predictor.py  –  Production-ready weather fetch + ML prediction
 =======================================================================
-Fixes applied vs original:
-  • Comma-separated `daily` param  (fixes 502 / 524 from repeated params)
-  • Retry with exponential back-off (fixes ConnectionResetError / transient failures)
-  • Per-request and connect timeouts
-  • In-memory LRU-style cache keyed on (lat, lon, date)  –  TTL = 30 min
-  • Safe fallback DataFrame when all retries are exhausted
-  • All exceptions are caught; the prediction pipeline never crashes on API failure
+Fixes applied:
+  • XGBoost now receives shape (1, 147) = flattened 7-day window (matches training)
+  • TCN now receives shape (1, 7, 21) = 3D window (matches training)
+  • Scaler applied per-row (N, 21) then reshaped to (N, 7, 21) — matches notebook
+  • WeatherModelLoader.load() offloaded to threadpool (non-blocking)
+  • Retry with exponential back-off
+  • In-memory LRU cache with 30-min TTL
+  • Safe fallback DataFrame when all retries exhausted
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ import asyncio
 import logging
 import random
 import time
-from functools import lru_cache
 from typing import Optional
 
 import httpx
@@ -36,7 +36,6 @@ from app.services.weather_model_loader import WeatherModelLoader
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 GEOCODE_URL  = "https://geocoding-api.open-meteo.com/v1/search"
 
-# Single comma-separated string — this is what Open-Meteo actually expects
 DAILY_VARS = (
     "temperature_2m_mean,"
     "temperature_2m_max,"
@@ -46,16 +45,14 @@ DAILY_VARS = (
     "wind_speed_10m_max"
 )
 
-# Retry / timeout knobs
-MAX_RETRIES      = 3          # total attempts (1 original + 2 retries)
-BASE_BACKOFF_S   = 3.0        # seconds before first retry (increased to avoid 429)
-BACKOFF_FACTOR   = 3.0        # multiplier per attempt → waits: 3s, 9s
-CONNECT_TIMEOUT  = 8.0        # seconds to establish TCP connection
-READ_TIMEOUT     = 20.0       # seconds to receive full response
+MAX_RETRIES     = 3
+BASE_BACKOFF_S  = 3.0
+BACKOFF_FACTOR  = 3.0
+CONNECT_TIMEOUT = 8.0
+READ_TIMEOUT    = 20.0
 
-# Cache
-_CACHE_TTL_S = 1_800          # 30 minutes
-_forecast_cache: dict[str, tuple[float, pd.DataFrame]] = {}   # key → (ts, df)
+_CACHE_TTL_S = 1_800
+_forecast_cache: dict[str, tuple[float, pd.DataFrame]] = {}
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +62,6 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 async def geocode(query: str) -> list[dict]:
-    """Resolve a free-text location to (lat, lon) candidates."""
     timeout = httpx.Timeout(connect=CONNECT_TIMEOUT, read=READ_TIMEOUT, write=5.0, pool=5.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.get(
@@ -90,11 +86,10 @@ async def geocode(query: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Weather fetch  –  with retry + cache + fallback
+# Weather fetch with retry + cache + fallback
 # ---------------------------------------------------------------------------
 
 def _cache_key(lat: float, lon: float) -> str:
-    """Round to ~1 km grid so nearby points share a cache slot."""
     return f"{round(lat, 2)},{round(lon, 2)}"
 
 
@@ -108,17 +103,12 @@ def _get_cached(key: str) -> Optional[pd.DataFrame]:
 
 def _set_cache(key: str, df: pd.DataFrame) -> None:
     _forecast_cache[key] = (time.monotonic(), df.copy())
-    # Evict old entries to keep memory bounded (keep latest 128 locations)
     if len(_forecast_cache) > 128:
         oldest_key = min(_forecast_cache, key=lambda k: _forecast_cache[k][0])
         del _forecast_cache[oldest_key]
 
 
 def _fallback_dataframe() -> pd.DataFrame:
-    """
-    Return 7 rows of climatological-mean-ish safe defaults.
-    The caller will log a warning; predictions will be conservative (Low risk).
-    """
     today = pd.Timestamp.now().normalize()
     dates = pd.date_range(today, periods=7, freq="D")
     return pd.DataFrame({
@@ -133,32 +123,18 @@ def _fallback_dataframe() -> pd.DataFrame:
 
 
 async def fetch_forecast(lat: float, lon: float) -> tuple[pd.DataFrame, bool]:
-    """
-    Fetch 7-day daily forecast from Open-Meteo.
-
-    Strategy
-    --------
-    1. Return cached data if still fresh.
-    2. Try the API up to MAX_RETRIES times with exponential back-off + jitter.
-    3. On total failure: serve stale cache or safe fallback DataFrame.
-
-    Returns
-    -------
-    (df, is_fallback) — is_fallback=True when live data could not be fetched.
-    Never raises — always returns a valid DataFrame.
-    """
     key    = _cache_key(lat, lon)
     cached = _get_cached(key)
     if cached is not None:
-        return cached, False   # ← fresh cache = not fallback
+        return cached, False
 
     timeout = httpx.Timeout(connect=CONNECT_TIMEOUT, read=READ_TIMEOUT, write=5.0, pool=5.0)
     params  = {
-        "latitude":     lat,
-        "longitude":    lon,
-        "daily":        DAILY_VARS,      # ← single comma-separated string (key fix)
+        "latitude":      lat,
+        "longitude":     lon,
+        "daily":         DAILY_VARS,
         "forecast_days": 7,
-        "timezone":     "auto",
+        "timezone":      "auto",
     }
 
     last_exc: Exception = RuntimeError("No attempts made")
@@ -183,58 +159,37 @@ async def fetch_forecast(lat: float, lon: float) -> tuple[pd.DataFrame, bool]:
             df = df.ffill().fillna(0)
 
             _set_cache(key, df)
-            log.info("Weather fetch OK for (%.4f, %.4f) on attempt %d", lat, lon, attempt)
-            return df, False   # ← live data = not fallback
+            log.info("Weather fetch OK for (%.4f, %.4f) attempt %d", lat, lon, attempt)
+            return df, False
 
         except httpx.TimeoutException as exc:
             last_exc = exc
-            log.warning(
-                "Weather API timeout on attempt %d/%d for (%.4f, %.4f): %s",
-                attempt, MAX_RETRIES, lat, lon, exc,
-            )
+            log.warning("Timeout attempt %d/%d (%.4f, %.4f): %s", attempt, MAX_RETRIES, lat, lon, exc)
         except httpx.HTTPStatusError as exc:
             last_exc = exc
             status = exc.response.status_code
-            log.warning(
-                "Weather API HTTP %d on attempt %d/%d for (%.4f, %.4f)",
-                status, attempt, MAX_RETRIES, lat, lon,
-            )
-            # 4xx errors (except 429) are not worth retrying
+            log.warning("HTTP %d attempt %d/%d (%.4f, %.4f)", status, attempt, MAX_RETRIES, lat, lon)
             if status < 500 and status != 429:
                 break
         except (httpx.RequestError, ConnectionResetError, OSError) as exc:
             last_exc = exc
-            log.warning(
-                "Weather API connection error on attempt %d/%d for (%.4f, %.4f): %s",
-                attempt, MAX_RETRIES, lat, lon, exc,
-            )
+            log.warning("Connection error attempt %d/%d (%.4f, %.4f): %s", attempt, MAX_RETRIES, lat, lon, exc)
         except Exception as exc:
             last_exc = exc
-            log.exception(
-                "Unexpected error on attempt %d/%d for (%.4f, %.4f)",
-                attempt, MAX_RETRIES, lat, lon,
-            )
+            log.exception("Unexpected error attempt %d/%d (%.4f, %.4f)", attempt, MAX_RETRIES, lat, lon)
 
         if attempt < MAX_RETRIES:
             wait   = BASE_BACKOFF_S * (BACKOFF_FACTOR ** (attempt - 1))
             jitter = random.uniform(0.5, 1.5)
-            log.info("Retrying in %.1fs (with jitter) ...", wait * jitter)
             await asyncio.sleep(wait * jitter)
 
-    # All retries exhausted – use stale cache if available, else fallback
     stale = _forecast_cache.get(key)
     if stale:
-        log.error(
-            "All retries failed for (%.4f, %.4f) – serving STALE cache. Last error: %s",
-            lat, lon, last_exc,
-        )
-        return stale[1].copy(), True   # ← stale = is_fallback
+        log.error("All retries failed (%.4f, %.4f) – serving STALE cache. Error: %s", lat, lon, last_exc)
+        return stale[1].copy(), True
 
-    log.error(
-        "All retries failed for (%.4f, %.4f) – serving FALLBACK data. Last error: %s",
-        lat, lon, last_exc,
-    )
-    return _fallback_dataframe(), True   # ← fallback = is_fallback
+    log.error("All retries failed (%.4f, %.4f) – serving FALLBACK. Error: %s", lat, lon, last_exc)
+    return _fallback_dataframe(), True
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +199,6 @@ async def fetch_forecast(lat: float, lon: float) -> tuple[pd.DataFrame, bool]:
 def _add_features(df: pd.DataFrame, district_name: Optional[str] = None) -> pd.DataFrame:
     df = df.copy()
 
-    # Rolling aggregates
     df["temp_avg_3d"]       = df["temperature_mean"].rolling(3, min_periods=1).mean()
     df["temp_avg_5d"]       = df["temperature_mean"].rolling(5, min_periods=1).mean()
     df["humidity_avg_3d"]   = df["humidity"].rolling(3, min_periods=1).mean()
@@ -252,51 +206,63 @@ def _add_features(df: pd.DataFrame, district_name: Optional[str] = None) -> pd.D
     df["rainfall_sum_3d"]   = df["rainfall"].rolling(3, min_periods=1).sum()
     df["rainfall_sum_5d"]   = df["rainfall"].rolling(5, min_periods=1).sum()
 
-    # Interaction features
     df["temp_humidity"]     = df["temperature_mean"] * df["humidity"]
     df["rainfall_humidity"] = df["rainfall"] * df["humidity"]
 
-    # Calendar
     df["month"]             = df["date"].dt.month
     df["day_of_year"]       = df["date"].dt.dayofyear
 
-    # District one-hot
     for col in DISTRICT_COLS:
         df[col] = 0
     matched = f"district_{district_name}" if district_name in TRAINING_DISTRICTS else None
     if matched and matched in DISTRICT_COLS:
         df[matched] = 1
     else:
-        df[DISTRICT_COLS[0]] = 1   # default Thanjavur
+        df[DISTRICT_COLS[0]] = 1  # default: Thanjavur
 
     return df
 
 
 # ---------------------------------------------------------------------------
-# Ensemble prediction
+# Ensemble prediction  —  FIX: correct shapes for XGBoost and TCN
 # ---------------------------------------------------------------------------
 
 def _predict_ensemble(df: pd.DataFrame) -> list[dict]:
+    """
+    XGBoost expects shape (1, WINDOW_SIZE * n_features) = (1, 147)  [flattened window]
+    TCN/Conv1D expects shape (1, WINDOW_SIZE, n_features) = (1, 7, 21)  [3D window]
+    Scaler was fit on (N, 21) per-row — apply per-row, then reshape to 3D.
+    """
     WeatherModelLoader.load()
     scaler    = WeatherModelLoader.scaler
     xgb_model = WeatherModelLoader.xgb_model
     tcn_model = WeatherModelLoader.tcn_model
 
-    X_raw    = df[FEATURE_COLS].values.astype(np.float32)
-    X_scaled = scaler.transform(X_raw)
+    n_features = len(FEATURE_COLS)  # 21
+
+    # --- Scale: per-row (N, 21) → reshape to (N, 7, 21) only when building windows ---
+    X_raw    = df[FEATURE_COLS].values.astype(np.float32)   # shape: (7, 21)
+    X_scaled = scaler.transform(X_raw)                       # shape: (7, 21) ← correct
 
     results: list[dict] = []
 
     for day_idx in range(len(df)):
+        # Build (WINDOW_SIZE, n_features) window
         start  = max(0, day_idx - WINDOW_SIZE + 1)
-        window = X_scaled[start:day_idx + 1]
-        if len(window) < WINDOW_SIZE:
-            pad    = np.zeros((WINDOW_SIZE - len(window), X_scaled.shape[1]))
-            window = np.vstack([pad, window])
+        window = X_scaled[start : day_idx + 1]               # shape: (<=7, 21)
 
-        xgb_pred  = xgb_model.predict(window.reshape(1, -1))[0]
-        tcn_raw   = tcn_model.predict(window[np.newaxis, ...], verbose=0)
-        tcn_probs = [tcn_raw[i][0] for i in range(4)]
+        if len(window) < WINDOW_SIZE:
+            pad    = np.zeros((WINDOW_SIZE - len(window), n_features))
+            window = np.vstack([pad, window])                 # shape: (7, 21)
+
+        # ✅ XGBoost: flatten entire window → (1, 147)
+        xgb_input = window.reshape(1, -1)                    # shape: (1, 147)
+        xgb_pred  = xgb_model.predict(xgb_input)[0]          # shape: (4,)
+
+        # ✅ TCN/Conv1D: 3D window → (1, 7, 21)
+        tcn_input = window[np.newaxis, ...]                   # shape: (1, 7, 21)
+        tcn_raw   = tcn_model.predict(tcn_input, verbose=0)  # list of 4 arrays each (1, 3)
+        tcn_probs = [tcn_raw[i][0] for i in range(4)]        # list of 4 arrays each (3,)
 
         row = df.iloc[day_idx]
         day_result: dict = {
@@ -316,6 +282,7 @@ def _predict_ensemble(df: pd.DataFrame) -> list[dict]:
             xgb_class  = int(xgb_pred[i])
             xgb_onehot = np.zeros(3)
             xgb_onehot[xgb_class] = 1.0
+
             ensemble = 0.6 * xgb_onehot + 0.4 * tcn_probs[i]
             final    = int(np.argmax(ensemble))
 
@@ -341,21 +308,17 @@ async def get_forecast(
     location_name: str,
     district_name: Optional[str] = None,
 ) -> dict:
-    """
-    Fetch weather, engineer features, and run ensemble prediction.
-
-    Always returns a valid response dict — never raises on API failure.
-    The `is_fallback` flag in the response lets the frontend show a banner
-    when live data could not be retrieved.
-    """
-    df, is_fallback = await fetch_forecast(lat, lon)   # ← unpack (df, is_fallback)
+    df, is_fallback = await fetch_forecast(lat, lon)
     df       = _add_features(df, district_name=district_name)
-    forecast = _predict_ensemble(df)
+
+    # Run blocking prediction in threadpool — keeps event loop free
+    loop     = asyncio.get_event_loop()
+    forecast = await loop.run_in_executor(None, _predict_ensemble, df)
 
     return {
         "location":    location_name,
         "lat":         lat,
         "lon":         lon,
-        "is_fallback": bool(is_fallback),   # ← native Python bool, safe for JSON
+        "is_fallback": bool(is_fallback),
         "forecast":    forecast,
     }

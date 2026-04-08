@@ -1,20 +1,44 @@
+"""
+main.py
+=======
+Fix: WeatherModelLoader.load() and ModelLoader.load() are blocking (joblib/tensorflow).
+     Calling them directly inside async lifespan blocks the event loop.
+     Fixed by running them in a threadpool via run_in_executor.
+"""
+
+import asyncio
+import logging
+import os
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from contextlib import asynccontextmanager
-import os
+from fastapi.staticfiles import StaticFiles
 
 from app.services.model_loader import ModelLoader
 from app.services.weather_model_loader import WeatherModelLoader
 from app.routes.predict import router as predict_router
 from app.routes.weather import router as weather_router
 
+log = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    ModelLoader.load()
-    WeatherModelLoader.load()
+    loop = asyncio.get_event_loop()
+
+    # Run both blocking loaders concurrently in threadpool — event loop stays free
+    try:
+        await asyncio.gather(
+            loop.run_in_executor(None, ModelLoader.load),
+            loop.run_in_executor(None, WeatherModelLoader.load),
+        )
+        log.info("All models loaded successfully.")
+    except Exception as e:
+        # Log but don't crash — /health endpoint will report which model failed
+        log.error("Model loading error during startup: %s", e)
+
     yield
 
 
@@ -54,4 +78,4 @@ if os.path.exists(static_dir):
         fp = f"{static_dir}/{full_path}"
         return FileResponse(fp) if os.path.exists(fp) else FileResponse(f"{static_dir}/index.html")
 else:
-    print(f"WARNING: static dir not found at {static_dir}")
+    log.warning("Static dir not found at %s — frontend will not be served.", static_dir)
