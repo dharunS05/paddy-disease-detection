@@ -30,16 +30,21 @@ jobs:
           git config --global user.email "ci@github.com"
           git config --global user.name "GitHub CI"
 
-          # ← underscore here
           git clone https://mlresearcher05:$HF_TOKEN@huggingface.co/spaces/mlresearcher05/paddy_disease_detection hf_space
 
+          # Clear old content except .git
           find hf_space -mindepth 1 -not -path 'hf_space/.git*' -delete
 
+          # Copy Dockerfile (single-stage, uses pre-built dist)
           cp Dockerfile hf_space/Dockerfile
           cp README.md  hf_space/README.md
+
+          # Copy backend source
           cp -r backend hf_space/backend
-          mkdir -p hf_space/frontend
-          cp -r frontend/dist hf_space/frontend/dist
+
+          # Copy pre-built frontend dist only (no package.json needed)
+          mkdir -p hf_space/frontend/dist
+          cp -r frontend/dist/. hf_space/frontend/dist/
 
           cd hf_space
           git add -A

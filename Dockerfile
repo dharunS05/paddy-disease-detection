@@ -1,25 +1,6 @@
-# ─────────────────────────────────────────────────────────────
-# Stage 1: Build React frontend
-# Context: repo root, so frontend/ is accessible
-# ─────────────────────────────────────────────────────────────
-FROM node:20-alpine AS frontend-builder
+# Frontend is pre-built by GitHub Actions CI and pushed as frontend/dist/
+# No Node.js build stage needed here.
 
-WORKDIR /frontend
-
-COPY frontend/package.json ./
-RUN npm install
-
-COPY frontend/ ./
-
-ARG VITE_API_URL=/api
-ENV VITE_API_URL=$VITE_API_URL
-
-RUN npm run build
-
-
-# ─────────────────────────────────────────────────────────────
-# Stage 2: Python backend + bundled frontend static files
-# ─────────────────────────────────────────────────────────────
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -33,15 +14,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/app/ ./app/
 
-# Copy built frontend from Stage 1
-COPY --from=frontend-builder /frontend/dist/ ./static/
+# Use the pre-built frontend dist from CI
+COPY frontend/dist/ ./static/
 
 RUN mkdir -p /app/models/hf_cache
 
 ENV MODEL_FILENAME=rice_v3_efficientnet_best_full_finetune.keras
 ENV HF_HOME=/app/models/hf_cache
 
-# HF Spaces runs as non-root user 1000 — set permissions
+# HF Spaces runs as non-root user 1000
 RUN chown -R 1000:1000 /app
 
 EXPOSE 7860
