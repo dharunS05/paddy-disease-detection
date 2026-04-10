@@ -1,10 +1,10 @@
 """
-weather_predictor.py  –  Production-ready weather fetch + ML prediction
-=======================================================================
-Fixes applied:
-  • XGBoost now receives shape (1, 147) = flattened 7-day window (matches training)
-  • TCN now receives shape (1, 7, 21) = 3D window (matches training)
-  • Scaler applied per-row (N, 21) then reshaped to (N, 7, 21) — matches notebook
+weather_predictor.py  –  Production-ready weather fetch + XGBoost prediction
+=============================================================================
+Changes from previous version:
+  • TCN model removed — XGBoost is now the sole prediction model
+  • XGBoost receives shape (1, 147) = flattened 7-day window (matches training)
+  • Scaler applied per-row (N, 21) — matches notebook
   • WeatherModelLoader.load() offloaded to threadpool (non-blocking)
   • Retry with exponential back-off
   • In-memory LRU cache with 30-min TTL
@@ -224,30 +224,28 @@ def _add_features(df: pd.DataFrame, district_name: Optional[str] = None) -> pd.D
 
 
 # ---------------------------------------------------------------------------
-# Ensemble prediction  —  FIX: correct shapes for XGBoost and TCN
+# XGBoost-only prediction  —  shape: (1, WINDOW_SIZE * n_features) = (1, 147)
 # ---------------------------------------------------------------------------
 
-def _predict_ensemble(df: pd.DataFrame) -> list[dict]:
+def _predict_xgboost(df: pd.DataFrame) -> list[dict]:
     """
     XGBoost expects shape (1, WINDOW_SIZE * n_features) = (1, 147)  [flattened window]
-    TCN/Conv1D expects shape (1, WINDOW_SIZE, n_features) = (1, 7, 21)  [3D window]
-    Scaler was fit on (N, 21) per-row — apply per-row, then reshape to 3D.
+    Scaler was fit on (N, 21) per-row — apply per-row first, then flatten window.
     """
     WeatherModelLoader.load()
     scaler    = WeatherModelLoader.scaler
     xgb_model = WeatherModelLoader.xgb_model
-    tcn_model = WeatherModelLoader.tcn_model
 
     n_features = len(FEATURE_COLS)  # 21
 
-    # --- Scale: per-row (N, 21) → reshape to (N, 7, 21) only when building windows ---
+    # Scale per-row: (7, 21) → (7, 21)
     X_raw    = df[FEATURE_COLS].values.astype(np.float32)   # shape: (7, 21)
-    X_scaled = scaler.transform(X_raw)                       # shape: (7, 21) ← correct
+    X_scaled = scaler.transform(X_raw)                       # shape: (7, 21)
 
     results: list[dict] = []
 
     for day_idx in range(len(df)):
-        # Build (WINDOW_SIZE, n_features) window
+        # Build (WINDOW_SIZE, n_features) window with zero-padding if needed
         start  = max(0, day_idx - WINDOW_SIZE + 1)
         window = X_scaled[start : day_idx + 1]               # shape: (<=7, 21)
 
@@ -255,14 +253,10 @@ def _predict_ensemble(df: pd.DataFrame) -> list[dict]:
             pad    = np.zeros((WINDOW_SIZE - len(window), n_features))
             window = np.vstack([pad, window])                 # shape: (7, 21)
 
-        # ✅ XGBoost: flatten entire window → (1, 147)
-        xgb_input = window.reshape(1, -1)                    # shape: (1, 147)
-        xgb_pred  = xgb_model.predict(xgb_input)[0]          # shape: (4,)
-
-        # ✅ TCN/Conv1D: 3D window → (1, 7, 21)
-        tcn_input = window[np.newaxis, ...]                   # shape: (1, 7, 21)
-        tcn_raw   = tcn_model.predict(tcn_input, verbose=0)  # list of 4 arrays each (1, 3)
-        tcn_probs = [tcn_raw[i][0] for i in range(4)]        # list of 4 arrays each (3,)
+        # XGBoost: flatten entire window → (1, 147)
+        xgb_input  = window.reshape(1, -1)                   # shape: (1, 147)
+        xgb_pred   = xgb_model.predict(xgb_input)[0]         # shape: (4,) — one class per disease
+        xgb_proba  = xgb_model.predict_proba(xgb_input)      # list of 4 arrays, each (1, 3)
 
         row = df.iloc[day_idx]
         day_result: dict = {
@@ -279,18 +273,12 @@ def _predict_ensemble(df: pd.DataFrame) -> list[dict]:
         }
 
         for i, disease in enumerate(DISEASES):
-            xgb_class  = int(xgb_pred[i])
-            xgb_onehot = np.zeros(3)
-            xgb_onehot[xgb_class] = 1.0
-
-            ensemble = 0.6 * xgb_onehot + 0.4 * tcn_probs[i]
-            final    = int(np.argmax(ensemble))
+            pred_class  = int(xgb_pred[i])
+            confidence  = float(np.max(xgb_proba[i][0]))
 
             day_result["diseases"][disease] = {
-                "risk":       RISK_LEVELS[final],
-                "confidence": round(float(np.max(ensemble)), 3),
-                "xgb_risk":   RISK_LEVELS[xgb_class],
-                "tcn_risk":   RISK_LEVELS[int(np.argmax(tcn_probs[i]))],
+                "risk":       RISK_LEVELS[pred_class],
+                "confidence": round(confidence, 3),
             }
 
         results.append(day_result)
@@ -313,7 +301,7 @@ async def get_forecast(
 
     # Run blocking prediction in threadpool — keeps event loop free
     loop     = asyncio.get_event_loop()
-    forecast = await loop.run_in_executor(None, _predict_ensemble, df)
+    forecast = await loop.run_in_executor(None, _predict_xgboost, df)
 
     return {
         "location":    location_name,

@@ -1,17 +1,18 @@
 """
 weather_model_loader.py
 =======================
-Fixes applied:
-  • Full try/except around each model download — failure logged, not silently swallowed
-  • _loaded stays False on partial failure so next request retries cleanly
+Changes from previous version:
+  • TCN/Keras model removed — XGBoost is the sole prediction model
+  • TensorFlow/Keras import removed
   • Thread-safe: load() is safe to call from run_in_executor (no asyncio inside)
+  • Full try/except around each asset download — failure logged, not silently swallowed
+  • _loaded stays False on partial failure so next request retries cleanly
   • HF_HOME env var respected for cache directory
 """
 
 import os
 import logging
 import joblib
-import tensorflow as tf
 from huggingface_hub import hf_hub_download
 
 log = logging.getLogger(__name__)
@@ -21,7 +22,6 @@ MODEL_REPO = "mlresearcher05/paddy-disease-detection"
 
 class WeatherModelLoader:
     xgb_model = None
-    tcn_model = None
     scaler    = None
     _loaded   = False
 
@@ -51,24 +51,12 @@ class WeatherModelLoader:
             raise RuntimeError(f"XGBoost model load failed: {e}") from e
 
         try:
-            log.info("[WeatherModelLoader] Downloading TCN/Conv1D model...")
-            cls.tcn_model = tf.keras.models.load_model(
-                _dl("paddy_tcn_multi_output.h5"), compile=False
-            )
-            log.info("[WeatherModelLoader] TCN model loaded OK.")
-        except Exception as e:
-            log.error("[WeatherModelLoader] Failed to load TCN model: %s", e)
-            cls.xgb_model = None  # reset partial state
-            raise RuntimeError(f"TCN model load failed: {e}") from e
-
-        try:
             log.info("[WeatherModelLoader] Downloading scaler...")
             cls.scaler = joblib.load(_dl("scaler.pkl"))
             log.info("[WeatherModelLoader] Scaler loaded OK.")
         except Exception as e:
             log.error("[WeatherModelLoader] Failed to load scaler: %s", e)
-            cls.xgb_model = None
-            cls.tcn_model = None
+            cls.xgb_model = None  # reset partial state
             raise RuntimeError(f"Scaler load failed: {e}") from e
 
         cls._loaded = True
